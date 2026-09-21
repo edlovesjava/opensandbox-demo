@@ -94,14 +94,53 @@ Either way, logs should land somewhere the agent container can't write to or
 truncate (the sidecar and diagnostics API run outside the sandboxed
 container's own filesystem, which already satisfies this).
 
-## Open questions
+## Live validation (confirmed)
 
+Ran `scripts/test_credential_vault.py` against the local server. Findings:
+
+- **Server prerequisite**: `credentialProxy.enabled` is rejected unless the
+  server's own config (`~/.sandbox.toml`) has `[egress] mode = "dns+nft"`
+  (default is `"dns"`, which only supports domain-level allow/deny, not
+  credential injection). Changed locally and restarted the server to
+  proceed — this is a server-operator setting, not something a sandbox
+  creation request can override per-call.
+- **Egress sidecar image** (`opensandbox/egress:v1.1.7`) is not bundled and
+  must be pulled separately (`docker pull opensandbox/egress:v1.1.7`) —
+  the first sandbox-creation attempt after switching modes timed out
+  client-side while the server pulled it server-side; the create actually
+  succeeded async and left an orphaned sandbox+sidecar to clean up
+  manually. **Takeaway: pre-pull the egress image as part of environment
+  setup, and always create sandboxes with a generous timeout (or poll)
+  the first time a new mode is used.**
+- **Credential injection: CONFIRMED working, no extra CA setup needed.** A
+  plain unauthenticated request from inside the sandbox
+  (`urllib.request.urlopen('https://httpbin.org/headers')`, no curl
+  install — the deny-by-default policy blocks apt too) came back with:
+  ```json
+  "Authorization": "Bearer test-token-do-not-use-1234567890"
+  ```
+  The MITM injection worked out of the box against Python's default TLS
+  trust store — the CA-trust concern in the original draft of this plan
+  didn't materialize in practice. (Not yet confirmed against `git`/`gh`
+  specifically, or against a real GitHub PAT — see remaining open
+  questions.)
+- **Token isolation: CONFIRMED.** `env` inside the sandbox never showed the
+  fake token — it truly never enters the container's process space.
+- **Network policy: CONFIRMED.** A request to a non-allowlisted host
+  (`example.com`) failed outright (`CommandExecError`, exit 1) under the
+  deny-by-default policy, while the allowlisted host succeeded.
+
+## Remaining open questions
+
+- Repeat this validation with an actual `git clone`/`gh` call against
+  `api.github.com` and a real (throwaway/scoped) PAT, not just a raw HTTP
+  request — confirms the mechanism works for the actual tool the agent
+  will use, not just `urllib`.
 - Does the egress sidecar expose an audit-log endpoint for allow/deny/inject
-  decisions, or only the `/policy` and `/credential-vault` config endpoints?
-  Needs a live test once we create a sandbox with `credentialProxy.enabled`.
+  decisions, or only the `/policy` and `/credential-vault` config
+  endpoints? Still needs checking.
 - macOS Keychain vs 1Password CLI for host-side secret storage.
 - Whether this lives in this repo or a dedicated sister repo.
-- Token rotation: does the vault support updating a credential in place
-  (`CredentialVaultMutationRequest` with `expectedRevision`) without
-  recreating the sandbox? (Looks like yes, from the model shape — worth
-  confirming with a live test.)
+- Token rotation: does `CredentialVaultMutationRequest` with
+  `expectedRevision` let us rotate a credential in place without
+  recreating the sandbox? Model shape supports it; not yet tested live.
